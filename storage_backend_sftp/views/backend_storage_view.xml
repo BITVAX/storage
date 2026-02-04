@@ -34,6 +34,8 @@
                     />
                 <separator string="Compatibility Options" />
                 <field name="sftp_legacy_algorithms" />
+                <separator string="Debugging" />
+                <field name="sftp_verbose_logging" />
             </group>
         </group>
     </field>

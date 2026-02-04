@@ -52,6 +52,13 @@ class StorageBackend(models.Model):
         help="Enable ssh-rsa and other legacy algorithms for older SFTP servers "
         "that don't support modern key exchange algorithms.",
     )
+    sftp_verbose_logging = fields.Boolean(
+        string="Verbose Logging",
+        default=False,
+        help="Enable detailed logging of SFTP connection details including "
+        "server capabilities, cipher negotiation, and key fingerprints. "
+        "Useful for debugging connection issues.",
+    )
 
     @property
     def _server_env_fields(self):
@@ -67,6 +74,7 @@ class StorageBackend(models.Model):
                 "sftp_verify_hostkey": {},
                 "sftp_hostkey": {},
                 "sftp_legacy_algorithms": {},
+                "sftp_verbose_logging": {},
             }
         )
         return env_fields

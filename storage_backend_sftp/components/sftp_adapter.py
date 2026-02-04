@@ -182,41 +182,147 @@ def parse_hostkey(hostkey_input, hostname=None):
     raise ValueError(f"No valid host key found for {hostname or 'server'}")
 
 
+def _log_verbose(backend, message, *args):
+    """Log message only if verbose logging is enabled."""
+    if backend.sftp_verbose_logging:
+        _logger.info(message, *args)
+
+
 @contextmanager
 def sftp(backend):
-    transport = paramiko.Transport((backend.sftp_server, backend.sftp_port))
+    _log_verbose(
+        backend,
+        "SFTP: Connecting to %s:%s as %s (auth=%s, legacy=%s, verify_hostkey=%s)",
+        backend.sftp_server,
+        backend.sftp_port,
+        backend.sftp_login,
+        backend.sftp_auth_method,
+        backend.sftp_legacy_algorithms,
+        backend.sftp_verify_hostkey,
+    )
+
+    # Enable paramiko debug logging if verbose mode
+    if backend.sftp_verbose_logging:
+        logging.getLogger("paramiko").setLevel(logging.DEBUG)
+
+    # For legacy servers, disable newer rsa-sha2-* algorithms
+    # so paramiko falls back to ssh-rsa (SHA-1) for signing
+    disabled_algorithms = None
+    if backend.sftp_legacy_algorithms:
+        disabled_algorithms = {
+            "pubkeys": ["rsa-sha2-256", "rsa-sha2-512"],
+        }
+        _log_verbose(backend, "SFTP: Disabling algorithms: %s", disabled_algorithms)
+
+    transport = paramiko.Transport(
+        (backend.sftp_server, backend.sftp_port),
+        disabled_algorithms=disabled_algorithms,
+    )
 
     # Configure legacy algorithms if enabled (for older servers like banks)
     if backend.sftp_legacy_algorithms:
         security_options = transport.get_security_options()
-        if "ssh-rsa" not in security_options.key_types:
-            security_options.key_types = ("ssh-rsa",) + tuple(
-                security_options.key_types
-            )
+        _log_verbose(backend, "SFTP: Original key_types: %s", security_options.key_types)
+        _log_verbose(backend, "SFTP: Original kex: %s", security_options.kex)
+        # Force ssh-rsa at the beginning for both host key AND public key auth
+        security_options.key_types = ("ssh-rsa",) + tuple(
+            k for k in security_options.key_types if k != "ssh-rsa"
+        )
+        _log_verbose(backend, "SFTP: Modified key_types: %s", security_options.key_types)
 
     # Prepare hostkey verification if enabled
     hostkey = None
     if backend.sftp_verify_hostkey and backend.sftp_hostkey:
+        _log_verbose(backend, "SFTP: Parsing hostkey for %s", backend.sftp_server)
         hostkey = parse_hostkey(backend.sftp_hostkey, hostname=backend.sftp_server)
+        _log_verbose(backend, "SFTP: Hostkey parsed: %s", type(hostkey).__name__)
 
-    # Connect with appropriate auth method
-    if backend.sftp_auth_method == "pwd":
-        transport.connect(
-            username=backend.sftp_login,
-            password=backend.sftp_password,
-            hostkey=hostkey,
+    # Start transport (key exchange) separately to inspect server capabilities
+    try:
+        _log_verbose(backend, "SFTP: Starting key exchange...")
+        transport.start_client()
+
+        # Log server information AFTER key exchange
+        _log_verbose(backend, "SFTP: Server version: %s", transport.remote_version)
+        if hasattr(transport, "remote_cipher"):
+            _log_verbose(backend, "SFTP: Remote cipher: %s", transport.remote_cipher)
+        if hasattr(transport, "local_cipher"):
+            _log_verbose(backend, "SFTP: Local cipher: %s", transport.local_cipher)
+
+        # Get the server's host key
+        server_key = transport.get_remote_server_key()
+        _log_verbose(
+            backend,
+            "SFTP: Server host key: %s (fingerprint: %s)",
+            server_key.get_name(),
+            server_key.get_fingerprint().hex(),
         )
-    elif backend.sftp_auth_method == "ssh_key":
-        # load_ssh_key handles path/content/bytes/file-object
-        private_key = load_ssh_key(backend.sftp_ssh_private_key)
-        transport.connect(
-            username=backend.sftp_login,
-            pkey=private_key,
-            hostkey=hostkey,
-        )
+
+        # Verify hostkey if enabled
+        if hostkey:
+            if server_key.get_name() != hostkey.get_name():
+                raise paramiko.SSHException(
+                    f"Host key type mismatch: expected {hostkey.get_name()}, "
+                    f"got {server_key.get_name()}"
+                )
+            if server_key.asbytes() != hostkey.asbytes():
+                raise paramiko.SSHException(
+                    "Host key verification failed! "
+                    "Server key does not match expected key."
+                )
+            _log_verbose(backend, "SFTP: Host key verified successfully")
+
+        # Now authenticate
+        if backend.sftp_auth_method == "pwd":
+            _log_verbose(backend, "SFTP: Authenticating with password...")
+            transport.auth_password(
+                username=backend.sftp_login,
+                password=backend.sftp_password,
+            )
+        elif backend.sftp_auth_method == "ssh_key":
+            _log_verbose(
+                backend,
+                "SFTP: Loading private key from: %s",
+                backend.sftp_ssh_private_key[:50] + "..."
+                if len(backend.sftp_ssh_private_key or "") > 50
+                else backend.sftp_ssh_private_key,
+            )
+            private_key = load_ssh_key(backend.sftp_ssh_private_key)
+            _log_verbose(
+                backend,
+                "SFTP: Private key loaded: %s (fingerprint: %s)",
+                type(private_key).__name__,
+                private_key.get_fingerprint().hex(),
+            )
+            _log_verbose(backend, "SFTP: Authenticating with public key...")
+            transport.auth_publickey(
+                username=backend.sftp_login,
+                key=private_key,
+            )
+        _log_verbose(backend, "SFTP: Authentication successful!")
+    except paramiko.AuthenticationException as e:
+        _logger.error("SFTP: Authentication failed: %s", e)
+        # Try to get info about what the server accepts
+        try:
+            transport.auth_none(backend.sftp_login)
+        except paramiko.BadAuthenticationType as auth_err:
+            _logger.error(
+                "SFTP: Server accepts auth methods: %s", auth_err.allowed_types
+            )
+        except Exception:
+            pass
+        transport.close()
+        raise
+    except Exception as e:
+        _logger.error("SFTP: Connection failed: %s: %s", type(e).__name__, e)
+        transport.close()
+        raise
+
     client = paramiko.SFTPClient.from_transport(transport)
+    _log_verbose(backend, "SFTP: SFTP client created successfully")
     yield client
     transport.close()
+    _log_verbose(backend, "SFTP: Connection closed")
 
 
 class SFTPStorageBackendAdapter(Component):
