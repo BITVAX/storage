@@ -4,6 +4,7 @@
 # Copyright 2020 ACSONE SA/NV (<http://acsone.eu>)
 # @author Simone Orsi <simahawk@gmail.com>
 # License LGPL-3.0 or later (http://www.gnu.org/licenses/lgpl).
+import base64
 import errno
 import logging
 import os
@@ -20,6 +21,64 @@ except ImportError as err:  # pragma: no cover
     _logger.debug(err)
 
 
+def normalize_key_input(value):
+    """Normalize key input to string content.
+
+    Accepts:
+        - str: file path or direct key content
+        - bytes: key content as bytes
+        - file-like object: readable object with key content
+
+    Returns:
+        str: the key content
+    """
+    if value is None:
+        return None
+
+    # Handle file-like objects (have read method)
+    if hasattr(value, "read"):
+        content = value.read()
+        if hasattr(value, "seek"):
+            value.seek(0)  # Reset for potential reuse
+        if isinstance(content, bytes):
+            return content.decode("utf-8")
+        return content
+
+    # Handle bytes
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+
+    # Handle string (path or content)
+    if isinstance(value, str):
+        value = value.strip()
+
+        # Check if it looks like a file path (not key content)
+        is_path = value.startswith(("/", "~", "./", "../")) or (
+            not value.startswith("-----")  # Not PEM format
+            and not value.startswith("ssh-")  # Not SSH public key
+            and len(value) < 500  # Paths are short
+            and "\n" not in value  # Keys have newlines
+        )
+
+        if is_path:
+            expanded_path = os.path.expanduser(value)
+            if not os.path.isabs(expanded_path):
+                # Relative paths from home directory
+                expanded_path = os.path.join(os.path.expanduser("~"), expanded_path)
+
+            if os.path.exists(expanded_path):
+                with open(expanded_path, "r") as f:
+                    return f.read()
+            # If path doesn't exist but looks like a path, raise error
+            if value.startswith(("/", "~", "./", "../")):
+                raise FileNotFoundError(f"Key file not found: {expanded_path}")
+
+        # It's direct content
+        return value
+
+    raise TypeError(f"Unsupported key input type: {type(value)}")
+
+
 def sftp_mkdirs(client, path, mode=511):
     try:
         client.mkdir(path, mode)
@@ -31,7 +90,18 @@ def sftp_mkdirs(client, path, mode=511):
             raise  # pragma: no cover
 
 
-def load_ssh_key(ssh_key_buffer):
+def load_ssh_key(ssh_key_input):
+    """Load SSH private key from various input types.
+
+    Args:
+        ssh_key_input: str (path or content), bytes, or file-like object
+
+    Returns:
+        paramiko private key object
+    """
+    key_content = normalize_key_input(ssh_key_input)
+    ssh_key_buffer = StringIO(key_content)
+
     # Build list of supported key classes.
     # Conditionally including DSSKey for backward compatibility with older
     # versions of paramiko
@@ -51,15 +121,99 @@ def load_ssh_key(ssh_key_buffer):
     raise Exception("Invalid ssh private key")
 
 
+def parse_hostkey(hostkey_input, hostname=None):
+    """Parse a host key from various input types.
+
+    Args:
+        hostkey_input: str (path or content), bytes, or file-like object
+        hostname: If provided, search for this host in known_hosts format
+
+    Returns:
+        paramiko key object
+    """
+    hostkey_str = normalize_key_input(hostkey_input)
+    if not hostkey_str:
+        return None
+
+    lines = hostkey_str.strip().split("\n")
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        parts = line.split()
+
+        # known_hosts format: hostname key-type key-data [comment]
+        # direct format: key-type key-data [comment]
+        if len(parts) >= 3 and not parts[0].startswith("ssh-"):
+            # known_hosts format
+            host_field, key_type, key_data = parts[0], parts[1], parts[2]
+            # Check if hostname matches (supports comma-separated hosts)
+            if hostname:
+                hosts = host_field.split(",")
+                if not any(
+                    h == hostname or h.startswith(f"[{hostname}]") for h in hosts
+                ):
+                    continue
+        elif len(parts) >= 2:
+            # direct format: key-type key-data
+            key_type, key_data = parts[0], parts[1]
+        else:
+            continue
+
+        try:
+            key_bytes = base64.b64decode(key_data)
+        except Exception:
+            continue
+
+        try:
+            if key_type == "ssh-rsa":
+                return paramiko.RSAKey(data=key_bytes)
+            elif key_type == "ssh-ed25519":
+                return paramiko.Ed25519Key(data=key_bytes)
+            elif key_type.startswith("ecdsa-"):
+                return paramiko.ECDSAKey(data=key_bytes)
+            elif key_type == "ssh-dss" and hasattr(paramiko, "DSSKey"):
+                return paramiko.DSSKey(data=key_bytes)
+        except paramiko.SSHException:
+            continue
+
+    raise ValueError(f"No valid host key found for {hostname or 'server'}")
+
+
 @contextmanager
 def sftp(backend):
     transport = paramiko.Transport((backend.sftp_server, backend.sftp_port))
+
+    # Configure legacy algorithms if enabled (for older servers like banks)
+    if backend.sftp_legacy_algorithms:
+        security_options = transport.get_security_options()
+        if "ssh-rsa" not in security_options.key_types:
+            security_options.key_types = ("ssh-rsa",) + tuple(
+                security_options.key_types
+            )
+
+    # Prepare hostkey verification if enabled
+    hostkey = None
+    if backend.sftp_verify_hostkey and backend.sftp_hostkey:
+        hostkey = parse_hostkey(backend.sftp_hostkey, hostname=backend.sftp_server)
+
+    # Connect with appropriate auth method
     if backend.sftp_auth_method == "pwd":
-        transport.connect(username=backend.sftp_login, password=backend.sftp_password)
+        transport.connect(
+            username=backend.sftp_login,
+            password=backend.sftp_password,
+            hostkey=hostkey,
+        )
     elif backend.sftp_auth_method == "ssh_key":
-        ssh_key_buffer = StringIO(backend.sftp_ssh_private_key)
-        private_key = load_ssh_key(ssh_key_buffer)
-        transport.connect(username=backend.sftp_login, pkey=private_key)
+        # load_ssh_key handles path/content/bytes/file-object
+        private_key = load_ssh_key(backend.sftp_ssh_private_key)
+        transport.connect(
+            username=backend.sftp_login,
+            pkey=private_key,
+            hostkey=hostkey,
+        )
     client = paramiko.SFTPClient.from_transport(transport)
     yield client
     transport.close()
